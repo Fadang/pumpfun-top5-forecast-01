@@ -1,39 +1,32 @@
-"""pumpfun-top5-forecast-01 agent v6 — Monte Carlo trajectory forecaster,
-blended with a persistence prior.
+"""pumpfun-top5-forecast-01 agent v7 — Monte Carlo trajectory forecaster
+(v6 architecture) with LONG-HORIZON corrections.
 
-Architecture (new, not a v4/v5 knob tweak):
-  * MONTE CARLO: every candidate coin (top 80 by last log-cap) is simulated
-    forward with a bootstrap random walk: per-step log-returns resampled
-    from the EMPIRICAL return distribution of the input history, conditioned
-    on (venue, fine cap bucket).  Coins die with an empirical per-step
-    hazard by (venue, bucket); curve coins graduate to pool; a soft cap +
-    mean reversion bounds long-horizon caps.  "Phantom" newcomers (coins
-    born after history ends) are sampled per read, centred on the SIMULATED
-    top-5 level at that read (median named top-5 cap + 0.10: newcomers
-    arrive hot).  Phantoms compete in the ranking: they take places
-    (feeding the unnamed order share) and their caps feed the size
-    histogram.  The MC gives a genuine predictive distribution per place:
-    P(mint at place k) and the histogram of place-k log-caps.
-  * PRIOR (v4 persistence): the same softmax-over-mu + rank-kernel order
-    probabilities and normal-mixture sizes as v4.  The MC alone is
-    overconfident when calibrated on a 1-2 mark history (it locks 0.75
-    named mass onto simulated rockets while the real top 5 are newcomers);
-    the prior is the humility anchor.
-  * BLEND: forecast = W * MC + (1 - W) * prior, per place, for both order
-    probabilities and size-bin distributions, with SEPARATE weights: the
-    MC's per-coin order picks are only trusted once its rates are estimated
-    from several transitions (W_ORD = 0.7 * min(1, n_transitions/6)), while
-    its aggregate size histogram keeps a fixed weight (W_SIZE = 0.6).  The
-    named mass per place is capped by horizon: short horizons may name more
-    (persistence is real), long horizons must leave more unnamed (newcomers
-    dominate).  Cap: mean horizon <=1.5 -> 0.75 named; <=3.5 -> 0.55;
-    else -> 0.40.  A young-market drift (top-5 slots rise ~+0.05/step in a
-    fresh market's first hour, decaying to zero by age 2 h) lifts the
-    phantom centre and the size samples, because newcomers arrive at the
-    FUTURE top level.
-  * Deterministic: fixed seed, no wall clock, ties by mint ascending.
-    Stdlib only, Python 3.13. Reads $MAKEFUN_INPUT_DIR (else /input),
-    writes $MAKEFUN_OUTPUT_DIR/forecast.json.
+v7 changes vs v6 (all horizon-aware; short-horizon behaviour ~unchanged):
+  1. ADAPTIVE SOFT CAP: v6 mean-reverted simulated caps toward a hard-coded
+     3.9, calibrated on the 50-min practice market (slots 3.0-3.6). The final
+     market's slots are ~4.5-5.0, so v6's MC equilibrium sat ~0.3-0.5 below
+     the real slot level and its max-selected size centre ran ~+0.35 too
+     high in falling-slot worlds (synthetic eval_long: size -23.36 in the
+     cap*=3.8 world vs -16.00 in cap*=4.3). v7 estimates the soft cap from
+     the input history itself (median place-1 cap over the last 12 marks,
+     floored at v6's 3.9 so short-horizon behaviour is unchanged).
+  2. SLOT-TREND EXTRAPOLATION: per-place slot levels + a damped linear
+     trend of place-1 caps (last 12 marks), extrapolated to each read with
+     a saturating factor 12/(12+h) and clamped to [-0.3, +0.9]. It lifts
+     the phantom centre and centres a new BROAD size component.
+  3. SIZE WIDTH GROWS WITH HORIZON: prior-mixture sd 0.30 ->
+     0.30 + 0.015*sqrt(mean_h); plus a broad Normal component centred on
+     the extrapolated slot level (sd 0.45) with weight min(0.35, mean_h/150).
+     At 7-13 h the true read caps spread ~0.8 log10 across reads; a tight
+     distribution centred 0.3 off scores catastrophically.
+  4. ORDER AT VERY LONG HORIZON: named_cap gains a branch for mean_h > 12
+     (0.20, was 0.40): at 7-13 h most top-5 places are newcomers, so named
+     mass mostly steals from the unnamed share (synthetic worlds: v6 order
+     -24.4 vs -23.03 for naming nothing). The MC order weight also rises
+     toward 0.85 there (the stale persistence prior is the worst picker at
+     long horizon).
+Deterministic: fixed seed, no wall clock, ties by mint ascending.
+Stdlib only, Python 3.13.
 """
 import bisect
 import json
@@ -49,14 +42,22 @@ SEED = 20261112
 NSIMS_SHORT = 400   # horizons <= 12 steps
 NSIMS_LONG = 250    # horizons > 12 steps (final run: 42-78 steps)
 MAX_CANDS = 80
-SOFT_CAP = 3.9      # mean reversion starts above this log10 cap (SOL)
-KAPPA = 0.25        # per-step pull back toward SOFT_CAP above it
+KAPPA = 0.25        # per-step pull back toward the adaptive soft cap
 W_MC_ORD_MAX = 0.7  # max MC weight for ORDER probs
+W_MC_ORD_LONG = 0.85  # MC order weight at very long horizon (prior is stale)
 W_MC_SIZE = 0.6  # MC weight for SIZE distributions
 SIZE_NAMED = 0.95   # share of size mass named; rest spreads over unnamed bins
 MAX_NAMED_PER_PLACE = 12
 DRIFT_RATE_MAX = 0.06
 DRIFT_TOTAL_MAX = 0.60
+# v7 long-horizon knobs
+NAMED_CAP_LONG = 0.20   # named order mass cap when mean_h > 12 steps
+SIZE_SD_H = 0.015       # prior-size sd grows by this * sqrt(mean_h)
+BROAD_SD = 0.45         # sd of the broad size component (extrapolated slot)
+BROAD_W_MAX = 0.35      # max weight of the broad size component
+TREND_CLAMP_LO = -0.3   # extrapolated slot shift, lower clamp
+TREND_CLAMP_HI = 0.9    # extrapolated slot shift, upper clamp
+SLOT_WINDOW = 12        # marks used for slot levels / trend
 # v4 prior knobs (identical to main_v4.py)
 TEMP = 0.18
 UNNAMED_PRIOR = 0.45
@@ -93,7 +94,7 @@ def bucket(cap):
     #   <1.6 floor mass (sits at ~1.45, churns out), 1.6-2.5 danger zone
     #   (mean -0.21, sd 0.48), 2.5-3.0 pumpers (+0.24/step),
     #   3.0-3.5 steady growth (+0.05/step, never dies in-sample),
-    #   3.5+ top coins (same +0.05 drift, mean-reverted above SOFT_CAP).
+    #   3.5+ top coins (same +0.05 drift, mean-reverted above the adaptive soft cap).
     # NOTE: boundary is 1.6, not 2.0: a coin at 1.98 is a young pumper,
     # not a floor coin (the floor mass sits at exactly ~1.45).
     if cap < 1.6:
@@ -141,7 +142,52 @@ def main():
     max_h = horizons[-1]
     h_set = set(horizons)
     mean_h = sum(horizons) / len(horizons)
-    named_cap = 0.75 if mean_h <= 1.5 else (0.55 if mean_h <= 3.5 else 0.40)
+    named_cap = (0.75 if mean_h <= 1.5 else (0.55 if mean_h <= 3.5
+                 else (0.40 if mean_h <= 12 else NAMED_CAP_LONG)))
+    # ---- v7: slot levels + trend from the input history itself ----
+    # slot_med[k]: median place-k log-cap over the last SLOT_WINDOW marks
+    # (robust level of each top slot). slope1: least-squares slope of the
+    # place-1 slot over the same window (per step). The extrapolated slot
+    # level at horizon h is slot_med[k] + trend_shift(h), with a saturating
+    # extrapolation (shift -> slope*12 as h -> inf) clamped to [-0.3, +0.9].
+    # The MC's soft cap is this level, floored at v6's 3.9 (so short-horizon
+    # behaviour is unchanged: on the practice market the slots sit below
+    # 3.9; on the final run the market is 11 h old and its slots sit far
+    # above it, where the hard-coded 3.9 actively dragged the MC down).
+    # NOTE: every v7 correction below is gated on mean_h > 12 steps. The
+    # real-data splits only reach 10-40 min, where v6's MC is already well
+    # calibrated; the corrections exist for the 7-13 h final horizon only.
+    win = marks[-SLOT_WINDOW:]
+    slot_med = {}
+    for k in range(1, places + 1):
+        vals = sorted(log_cap(m["rows"][k - 1]) for m in win if len(m.get("rows") or []) >= k)
+        slot_med[k] = vals[len(vals) // 2] if vals else log_cap(marks[-1]["rows"][k - 1])
+    xs = list(range(len(win)))
+    ys = [log_cap(m["rows"][0]) for m in win if m.get("rows")]
+    n_xy = len(ys)
+    if n_xy >= 2:
+        mx = sum(xs[:n_xy]) / n_xy
+        my = sum(ys) / n_xy
+        den = sum((x - mx) ** 2 for x in xs[:n_xy])
+        slope1 = (sum((x - mx) * (y - my) for x, y in zip(xs[:n_xy], ys)) / den
+                  if den else 0.0)
+    else:
+        slope1 = 0.0
+    slope1 = max(-0.10, min(0.10, slope1))
+    soft_cap = max(3.9, slot_med[1])
+    long_regime = mean_h > 12
+
+    def trend_shift(h):
+        if not long_regime:
+            return 0.0
+        return max(TREND_CLAMP_LO,
+                   min(TREND_CLAMP_HI, slope1 * h * 12.0 / (12.0 + h)))
+
+    def slot_level(k, h):
+        return slot_med[k] + trend_shift(h)
+
+    size_sd_eff = SIZE_SD + (SIZE_SD_H * math.sqrt(mean_h) if long_regime else 0.0)
+    broad_w = min(BROAD_W_MAX, mean_h / 150.0) if long_regime else 0.0
     # calibration thickness: number of usable consecutive-mark transitions.
     # The MC's per-coin order picks are only trustworthy once its return /
     # death / graduation rates are estimated from several transitions; its
@@ -149,6 +195,10 @@ def main():
     n_trans = sum(1 for t in range(len(marks) - 1)
                   if marks[t].get("rows") and marks[t + 1].get("rows"))
     w_ord = W_MC_ORD_MAX * min(1.0, n_trans / 6.0)
+    if mean_h > 12:
+        # very long horizon: the persistence prior's picks are stale, trust
+        # the MC's survivors more (its weight rises toward W_MC_ORD_LONG).
+        w_ord = min(W_MC_ORD_LONG, w_ord + 0.15)
     # young-market drift: a fresh market's top-5 slots rise fast as it fills
     # in (~+0.05 log10/step in the practice market's first hour), decaying
     # to zero by age 2 h.  It lifts the phantom centre and the size samples
@@ -274,8 +324,8 @@ def main():
                     else:
                         pool = ret_pool(venue, cap)
                         cap = cap + pool[rng.randrange(len(pool))]
-                        if cap > SOFT_CAP:
-                            cap -= KAPPA * (cap - SOFT_CAP)
+                        if cap > soft_cap:
+                            cap -= KAPPA * (cap - soft_cap)
                         if cap < floor_cap:
                             alive = False
                         elif venue == "curve" and rng.random() < p_grad:
@@ -302,9 +352,11 @@ def main():
             # and the size histogram piled up below 2.00 on young markets.
             if scored:
                 top1 = scored[0][0]
-                centre = top1 + min(DRIFT_TOTAL_MAX, young_drift * h)
+                centre = top1 + min(DRIFT_TOTAL_MAX, young_drift * h) + trend_shift(h)
             else:
-                centre = max(last_mid, newcomer_mean) + min(DRIFT_TOTAL_MAX, young_drift * h + drift_rate * h)
+                centre = (max(last_mid, newcomer_mean)
+                          + min(DRIFT_TOTAL_MAX, young_drift * h + drift_rate * h)
+                          + trend_shift(h))
             for _ in range(phantom_count(h)):
                 gap = abs(rng.gauss(0.35, 0.35))
                 scored.append((centre - gap + rng.gauss(0.0, 0.15), None))
@@ -397,7 +449,7 @@ def main():
         for b in range(82):
             lo = float("-inf") if b == 0 else edges[b - 1]
             hi = float("inf") if b == 81 else edges[b]
-            p = sum(w * (norm_cdf(hi, mu, SIZE_SD) - norm_cdf(lo, mu, SIZE_SD))
+            p = sum(w * (norm_cdf(hi, mu, size_sd_eff) - norm_cdf(lo, mu, size_sd_eff))
                     for w, mu in mix)
             if p >= 0.000001:
                 prior_size[k][b] = p
@@ -433,13 +485,46 @@ def main():
                 r["p"] = round(r["p"] * f, 6)
         probabilities.extend(rows)
 
+    # ---- v7 size: re-centre the MC histogram on the extrapolated slot level
+    # (the MC's max-selected slot caps run ~+0.3 too high when true slots
+    # fall) and mix in a broad Normal centred on that level. ----
+    def bin_centre(b):
+        if b == 0:
+            return 1.975
+        if b == 81:
+            return 6.025
+        return (edges[b - 1] + edges[b]) / 2.0
+
+    mc_size_c = {k: {} for k in range(1, places + 1)}
+    for k in range(1, places + 1):
+        tot = sum(mc_size[k].values())
+        if tot <= 0:
+            continue
+        mc_mean = sum(p * bin_centre(b) for b, p in mc_size[k].items()) / tot
+        # re-centring is a long-regime correction only (see note above).
+        shift = 0
+        if long_regime:
+            shift = int(round((slot_level(k, mean_h) - mc_mean) / 0.05))
+            shift = max(-10, min(10, shift))
+        for b, p in mc_size[k].items():
+            nb = max(0, min(81, b + shift))
+            mc_size_c[k][nb] = mc_size_c[k].get(nb, 0.0) + p
+
     sizes = []
     for k in range(1, places + 1):
-        bins = set(mc_size[k]) | set(prior_size[k])
+        centre_k = slot_level(k, mean_h)
+        # iterate all 82 bins: the broad component has mass everywhere
+        # (tiny in the far tails); restricting to mc/prior bins would drop
+        # part of its weight into the unnamed remainder.
+        bins = range(82)
         rows = []
         for b in sorted(bins):
-            p = (W_MC_SIZE * mc_size[k].get(b, 0.0)
-                 + (1 - W_MC_SIZE) * prior_size[k].get(b, 0.0)) * SIZE_NAMED
+            lo = float("-inf") if b == 0 else edges[b - 1]
+            hi = float("inf") if b == 81 else edges[b]
+            p_broad = norm_cdf(hi, centre_k, BROAD_SD) - norm_cdf(lo, centre_k, BROAD_SD)
+            p = ((1.0 - broad_w) * (W_MC_SIZE * mc_size_c[k].get(b, 0.0)
+                 + (1 - W_MC_SIZE) * prior_size[k].get(b, 0.0))
+                 + broad_w * p_broad) * SIZE_NAMED
             if p >= 0.000001:
                 rows.append({"place": k, "bin": b, "p": round(p, 6)})
         ssum = sum(r["p"] for r in rows)
